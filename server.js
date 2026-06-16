@@ -3,7 +3,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 const crypto = require('crypto');
 require('dotenv').config();
 
@@ -11,13 +11,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Conexão PostgreSQL
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
-// Cria as tabelas se não existirem
+const resend = new Resend(process.env.RESEND_API_KEY);
+
 const inicializarBanco = async () => {
   await db.query(`
     CREATE TABLE IF NOT EXISTS usuarios (
@@ -29,7 +29,6 @@ const inicializarBanco = async () => {
       criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
-
   await db.query(`
     CREATE TABLE IF NOT EXISTS recuperacao_senha (
       id SERIAL PRIMARY KEY,
@@ -39,27 +38,11 @@ const inicializarBanco = async () => {
       usado BOOLEAN DEFAULT FALSE
     )
   `);
-
   console.log('✅ Banco inicializado!');
 };
 
 inicializarBanco();
 
-// Configuração do e-mail
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-  tls: {
-    rejectUnauthorized: false,
-  },
-});
-
-// Middleware de autenticação
 const autenticar = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ erro: 'Token não fornecido' });
@@ -72,12 +55,10 @@ const autenticar = async (req, res, next) => {
   }
 };
 
-// Teste
 app.get('/', (req, res) => {
   res.json({ mensagem: 'API Aspen Core funcionando!' });
 });
 
-// Cadastro
 app.post('/auth/cadastro', async (req, res) => {
   const { nome, email, senha } = req.body;
   if (!nome || !email || !senha)
@@ -88,19 +69,16 @@ app.post('/auth/cadastro', async (req, res) => {
     const existe = await db.query('SELECT id FROM usuarios WHERE email = $1', [email]);
     if (existe.rows.length > 0)
       return res.status(409).json({ erro: 'E-mail já cadastrado' });
-
     const senhaCriptografada = await bcrypt.hash(senha, 10);
     const resultado = await db.query(
       'INSERT INTO usuarios (nome, email, senha) VALUES ($1, $2, $3) RETURNING id',
       [nome, email, senhaCriptografada]
     );
-
     const token = jwt.sign(
       { id: resultado.rows[0].id, email, nome },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
-
     res.status(201).json({
       mensagem: 'Conta criada com sucesso!',
       token,
@@ -112,7 +90,6 @@ app.post('/auth/cadastro', async (req, res) => {
   }
 });
 
-// Login
 app.post('/auth/login', async (req, res) => {
   const { email, senha } = req.body;
   if (!email || !senha)
@@ -121,18 +98,15 @@ app.post('/auth/login', async (req, res) => {
     const resultado = await db.query('SELECT * FROM usuarios WHERE email = $1', [email]);
     if (resultado.rows.length === 0)
       return res.status(401).json({ erro: 'E-mail ou senha incorretos' });
-
     const usuario = resultado.rows[0];
     const senhaCorreta = await bcrypt.compare(senha, usuario.senha);
     if (!senhaCorreta)
       return res.status(401).json({ erro: 'E-mail ou senha incorretos' });
-
     const token = jwt.sign(
       { id: usuario.id, email: usuario.email, nome: usuario.nome },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
-
     res.json({
       mensagem: 'Login realizado com sucesso!',
       token,
@@ -144,7 +118,6 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// Perfil
 app.get('/usuario/perfil', autenticar, async (req, res) => {
   try {
     const resultado = await db.query(
@@ -159,7 +132,6 @@ app.get('/usuario/perfil', autenticar, async (req, res) => {
   }
 });
 
-// Esqueci senha
 app.post('/auth/esqueci-senha', async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ erro: 'Informe o e-mail' });
@@ -178,8 +150,8 @@ app.post('/auth/esqueci-senha', async (req, res) => {
       [usuario.id, token, expira]
     );
 
-    await transporter.sendMail({
-      from: `"Aspen Core" <${process.env.EMAIL_USER}>`,
+    await resend.emails.send({
+      from: 'Aspen Core <onboarding@resend.dev>',
       to: email,
       subject: 'Recuperação de senha — Aspen Core',
       html: `
@@ -208,7 +180,6 @@ app.post('/auth/esqueci-senha', async (req, res) => {
   }
 });
 
-// Redefinir senha
 app.post('/auth/redefinir-senha', async (req, res) => {
   const { email, codigo, novaSenha } = req.body;
   if (!email || !codigo || !novaSenha)
@@ -219,7 +190,6 @@ app.post('/auth/redefinir-senha', async (req, res) => {
     const usuarioRes = await db.query('SELECT * FROM usuarios WHERE email = $1', [email]);
     if (usuarioRes.rows.length === 0)
       return res.status(404).json({ erro: 'E-mail não encontrado' });
-
     const usuario = usuarioRes.rows[0];
     const tokenRes = await db.query(
       `SELECT * FROM recuperacao_senha 
@@ -227,18 +197,14 @@ app.post('/auth/redefinir-senha', async (req, res) => {
        ORDER BY id DESC LIMIT 1`,
       [usuario.id]
     );
-
     if (tokenRes.rows.length === 0)
       return res.status(400).json({ erro: 'Código inválido ou expirado' });
-
     const tokenSalvo = tokenRes.rows[0].token.substring(0, 6).toUpperCase();
     if (codigo.toUpperCase() !== tokenSalvo)
       return res.status(400).json({ erro: 'Código incorreto' });
-
     const senhaCriptografada = await bcrypt.hash(novaSenha, 10);
     await db.query('UPDATE usuarios SET senha = $1 WHERE id = $2', [senhaCriptografada, usuario.id]);
     await db.query('UPDATE recuperacao_senha SET usado = TRUE WHERE usuario_id = $1', [usuario.id]);
-
     res.json({ mensagem: 'Senha redefinida com sucesso!' });
   } catch (err) {
     console.error(err);
