@@ -1,5 +1,5 @@
 const express = require('express');
-const { Pool } = require('pg');
+const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
@@ -11,17 +11,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const db = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-});
+// Conexão MySQL
+const db = mysql.createPool(process.env.DATABASE_URL);
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+// Cria as tabelas se não existirem
 const inicializarBanco = async () => {
   await db.query(`
     CREATE TABLE IF NOT EXISTS usuarios (
-      id SERIAL PRIMARY KEY,
+      id INT AUTO_INCREMENT PRIMARY KEY,
       nome VARCHAR(100) NOT NULL,
       email VARCHAR(100) NOT NULL UNIQUE,
       senha VARCHAR(255) NOT NULL,
@@ -31,11 +30,12 @@ const inicializarBanco = async () => {
   `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS recuperacao_senha (
-      id SERIAL PRIMARY KEY,
-      usuario_id INT NOT NULL REFERENCES usuarios(id),
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      usuario_id INT NOT NULL,
       token VARCHAR(255) NOT NULL,
-      expira_em TIMESTAMP NOT NULL,
-      usado BOOLEAN DEFAULT FALSE
+      expira_em DATETIME NOT NULL,
+      usado BOOLEAN DEFAULT FALSE,
+      FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
     )
   `);
   console.log('✅ Banco inicializado!');
@@ -59,6 +59,7 @@ app.get('/', (req, res) => {
   res.json({ mensagem: 'API Aspen Core funcionando!' });
 });
 
+// Cadastro
 app.post('/auth/cadastro', async (req, res) => {
   const { nome, email, senha } = req.body;
   if (!nome || !email || !senha)
@@ -66,23 +67,23 @@ app.post('/auth/cadastro', async (req, res) => {
   if (senha.length < 8)
     return res.status(400).json({ erro: 'Senha deve ter pelo menos 8 caracteres' });
   try {
-    const existe = await db.query('SELECT id FROM usuarios WHERE email = $1', [email]);
-    if (existe.rows.length > 0)
+    const [existe] = await db.query('SELECT id FROM usuarios WHERE email = ?', [email]);
+    if (existe.length > 0)
       return res.status(409).json({ erro: 'E-mail já cadastrado' });
     const senhaCriptografada = await bcrypt.hash(senha, 10);
-    const resultado = await db.query(
-      'INSERT INTO usuarios (nome, email, senha) VALUES ($1, $2, $3) RETURNING id',
+    const [resultado] = await db.query(
+      'INSERT INTO usuarios (nome, email, senha) VALUES (?, ?, ?)',
       [nome, email, senhaCriptografada]
     );
     const token = jwt.sign(
-      { id: resultado.rows[0].id, email, nome },
+      { id: resultado.insertId, email, nome },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
     res.status(201).json({
       mensagem: 'Conta criada com sucesso!',
       token,
-      usuario: { id: resultado.rows[0].id, nome, email, plano: 'basico' },
+      usuario: { id: resultado.insertId, nome, email, plano: 'basico' },
     });
   } catch (err) {
     console.error(err);
@@ -90,15 +91,16 @@ app.post('/auth/cadastro', async (req, res) => {
   }
 });
 
+// Login
 app.post('/auth/login', async (req, res) => {
   const { email, senha } = req.body;
   if (!email || !senha)
     return res.status(400).json({ erro: 'Preencha todos os campos' });
   try {
-    const resultado = await db.query('SELECT * FROM usuarios WHERE email = $1', [email]);
-    if (resultado.rows.length === 0)
+    const [usuarios] = await db.query('SELECT * FROM usuarios WHERE email = ?', [email]);
+    if (usuarios.length === 0)
       return res.status(401).json({ erro: 'E-mail ou senha incorretos' });
-    const usuario = resultado.rows[0];
+    const usuario = usuarios[0];
     const senhaCorreta = await bcrypt.compare(senha, usuario.senha);
     if (!senhaCorreta)
       return res.status(401).json({ erro: 'E-mail ou senha incorretos' });
@@ -118,35 +120,37 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
+// Perfil
 app.get('/usuario/perfil', autenticar, async (req, res) => {
   try {
-    const resultado = await db.query(
-      'SELECT id, nome, email, plano, criado_em FROM usuarios WHERE id = $1',
+    const [rows] = await db.query(
+      'SELECT id, nome, email, plano, criado_em FROM usuarios WHERE id = ?',
       [req.usuario.id]
     );
-    if (resultado.rows.length === 0)
+    if (rows.length === 0)
       return res.status(404).json({ erro: 'Usuário não encontrado' });
-    res.json(resultado.rows[0]);
+    res.json(rows[0]);
   } catch {
     res.status(500).json({ erro: 'Erro interno do servidor' });
   }
 });
 
+// Esqueci senha
 app.post('/auth/esqueci-senha', async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ erro: 'Informe o e-mail' });
   try {
-    const resultado = await db.query('SELECT * FROM usuarios WHERE email = $1', [email]);
-    if (resultado.rows.length === 0)
+    const [usuarios] = await db.query('SELECT * FROM usuarios WHERE email = ?', [email]);
+    if (usuarios.length === 0)
       return res.json({ mensagem: 'Se este e-mail estiver cadastrado, você receberá as instruções.' });
 
-    const usuario = resultado.rows[0];
+    const usuario = usuarios[0];
     const token = crypto.randomBytes(32).toString('hex');
     const expira = new Date(Date.now() + 60 * 60 * 1000);
 
-    await db.query('DELETE FROM recuperacao_senha WHERE usuario_id = $1', [usuario.id]);
+    await db.query('DELETE FROM recuperacao_senha WHERE usuario_id = ?', [usuario.id]);
     await db.query(
-      'INSERT INTO recuperacao_senha (usuario_id, token, expira_em) VALUES ($1, $2, $3)',
+      'INSERT INTO recuperacao_senha (usuario_id, token, expira_em) VALUES (?, ?, ?)',
       [usuario.id, token, expira]
     );
 
@@ -180,6 +184,7 @@ app.post('/auth/esqueci-senha', async (req, res) => {
   }
 });
 
+// Redefinir senha
 app.post('/auth/redefinir-senha', async (req, res) => {
   const { email, codigo, novaSenha } = req.body;
   if (!email || !codigo || !novaSenha)
@@ -187,24 +192,24 @@ app.post('/auth/redefinir-senha', async (req, res) => {
   if (novaSenha.length < 8)
     return res.status(400).json({ erro: 'Senha deve ter pelo menos 8 caracteres' });
   try {
-    const usuarioRes = await db.query('SELECT * FROM usuarios WHERE email = $1', [email]);
-    if (usuarioRes.rows.length === 0)
+    const [usuarios] = await db.query('SELECT * FROM usuarios WHERE email = ?', [email]);
+    if (usuarios.length === 0)
       return res.status(404).json({ erro: 'E-mail não encontrado' });
-    const usuario = usuarioRes.rows[0];
-    const tokenRes = await db.query(
+    const usuario = usuarios[0];
+    const [tokens] = await db.query(
       `SELECT * FROM recuperacao_senha 
-       WHERE usuario_id = $1 AND usado = FALSE AND expira_em > NOW()
+       WHERE usuario_id = ? AND usado = FALSE AND expira_em > NOW()
        ORDER BY id DESC LIMIT 1`,
       [usuario.id]
     );
-    if (tokenRes.rows.length === 0)
+    if (tokens.length === 0)
       return res.status(400).json({ erro: 'Código inválido ou expirado' });
-    const tokenSalvo = tokenRes.rows[0].token.substring(0, 6).toUpperCase();
+    const tokenSalvo = tokens[0].token.substring(0, 6).toUpperCase();
     if (codigo.toUpperCase() !== tokenSalvo)
       return res.status(400).json({ erro: 'Código incorreto' });
     const senhaCriptografada = await bcrypt.hash(novaSenha, 10);
-    await db.query('UPDATE usuarios SET senha = $1 WHERE id = $2', [senhaCriptografada, usuario.id]);
-    await db.query('UPDATE recuperacao_senha SET usado = TRUE WHERE usuario_id = $1', [usuario.id]);
+    await db.query('UPDATE usuarios SET senha = ? WHERE id = ?', [senhaCriptografada, usuario.id]);
+    await db.query('UPDATE recuperacao_senha SET usado = TRUE WHERE usuario_id = ?', [usuario.id]);
     res.json({ mensagem: 'Senha redefinida com sucesso!' });
   } catch (err) {
     console.error(err);
