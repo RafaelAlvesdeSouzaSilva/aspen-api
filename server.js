@@ -3,7 +3,7 @@ const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const { Resend } = require('resend');
+const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 require('dotenv').config();
 
@@ -14,7 +14,14 @@ app.use(express.json());
 // Conexão MySQL
 const db = mysql.createPool(process.env.DATABASE_URL);
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+// Configuração do nodemailer com Gmail
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
 
 // Cria as tabelas se não existirem
 const inicializarBanco = async () => {
@@ -154,8 +161,8 @@ app.post('/auth/esqueci-senha', async (req, res) => {
       [usuario.id, token, expira]
     );
 
-    await resend.emails.send({
-      from: 'Aspen Core <onboarding@resend.dev>',
+    await transporter.sendMail({
+      from: `"Aspen Core" <${process.env.EMAIL_USER}>`,
       to: email,
       subject: 'Recuperação de senha — Aspen Core',
       html: `
