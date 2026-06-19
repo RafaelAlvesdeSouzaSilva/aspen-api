@@ -1,229 +1,287 @@
 const express = require('express');
-const mysql = require('mysql2/promise');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
-const crypto = require('crypto');
+const admin = require('firebase-admin');
 require('dotenv').config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Conexão MySQL
-const db = mysql.createPool(process.env.DATABASE_URL);
+// ============================================================
+// Inicialização do Firebase Admin
+// ============================================================
+// Em produção (Render), a credencial vem da variável de ambiente
+// FIREBASE_SERVICE_ACCOUNT (o JSON da service account, em uma linha só).
+// Como gerar: Firebase Console → Configurações do projeto →
+// Contas de serviço → Gerar nova chave privada.
 
-// Configuração do nodemailer com Gmail
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
 });
 
-// Cria as tabelas se não existirem
-const inicializarBanco = async () => {
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS usuarios (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      nome VARCHAR(100) NOT NULL,
-      email VARCHAR(100) NOT NULL UNIQUE,
-      senha VARCHAR(255) NOT NULL,
-      plano VARCHAR(20) DEFAULT 'basico',
-      criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS recuperacao_senha (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      usuario_id INT NOT NULL,
-      token VARCHAR(255) NOT NULL,
-      expira_em DATETIME NOT NULL,
-      usado BOOLEAN DEFAULT FALSE,
-      FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
-    )
-  `);
-  console.log('✅ Banco inicializado!');
-};
+const db = admin.firestore();
 
-inicializarBanco();
-
+// ============================================================
+// Middleware de autenticação — valida o ID token do Firebase
+// ============================================================
 const autenticar = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ erro: 'Token não fornecido' });
   try {
-    const dados = jwt.verify(token, process.env.JWT_SECRET);
-    req.usuario = dados;
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.usuario = decoded; // contém uid, email, etc.
     next();
-  } catch {
+  } catch (err) {
+    console.error('Token inválido:', err.message);
     res.status(401).json({ erro: 'Token inválido' });
   }
 };
 
+// ============================================================
+// Rota raiz
+// ============================================================
 app.get('/', (req, res) => {
   res.json({ mensagem: 'API Aspen Core funcionando!' });
 });
 
-// Cadastro
-app.post('/auth/cadastro', async (req, res) => {
-  const { nome, email, senha } = req.body;
-  if (!nome || !email || !senha)
-    return res.status(400).json({ erro: 'Preencha todos os campos' });
-  if (senha.length < 8)
-    return res.status(400).json({ erro: 'Senha deve ter pelo menos 8 caracteres' });
+// ============================================================
+// AUTH
+// ============================================================
+
+// Sincroniza o perfil no Firestore após o cadastro no Firebase Auth
+app.post('/auth/sync-profile', autenticar, async (req, res) => {
+  const { name } = req.body;
+  const { uid, email } = req.usuario;
   try {
-    const [existe] = await db.query('SELECT id FROM usuarios WHERE email = ?', [email]);
-    if (existe.length > 0)
-      return res.status(409).json({ erro: 'E-mail já cadastrado' });
-    const senhaCriptografada = await bcrypt.hash(senha, 10);
-    const [resultado] = await db.query(
-      'INSERT INTO usuarios (nome, email, senha) VALUES (?, ?, ?)',
-      [nome, email, senhaCriptografada]
-    );
-    const token = jwt.sign(
-      { id: resultado.insertId, email, nome },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-    res.status(201).json({
-      mensagem: 'Conta criada com sucesso!',
-      token,
-      usuario: { id: resultado.insertId, nome, email, plano: 'basico' },
-    });
+    const userRef = db.collection('users').doc(uid);
+    const snap = await userRef.get();
+
+    if (!snap.exists) {
+      await userRef.set({
+        name: name || '',
+        email,
+        plan: 'basico',
+        plan_expires_at: null,
+        plan_updated_at: null,
+        created_at: new Date().toISOString(),
+        last_login_at: null,
+      });
+    }
+
+    res.status(201).json({ mensagem: 'Perfil sincronizado com sucesso!' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ erro: 'Erro interno do servidor' });
+    res.status(500).json({ erro: 'Erro ao sincronizar perfil' });
   }
 });
 
-// Login
-app.post('/auth/login', async (req, res) => {
-  const { email, senha } = req.body;
-  if (!email || !senha)
-    return res.status(400).json({ erro: 'Preencha todos os campos' });
+// Retorna o perfil do usuário logado
+app.get('/auth/me', autenticar, async (req, res) => {
   try {
-    const [usuarios] = await db.query('SELECT * FROM usuarios WHERE email = ?', [email]);
-    if (usuarios.length === 0)
-      return res.status(401).json({ erro: 'E-mail ou senha incorretos' });
-    const usuario = usuarios[0];
-    const senhaCorreta = await bcrypt.compare(senha, usuario.senha);
-    if (!senhaCorreta)
-      return res.status(401).json({ erro: 'E-mail ou senha incorretos' });
-    const token = jwt.sign(
-      { id: usuario.id, email: usuario.email, nome: usuario.nome },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-    res.json({
-      mensagem: 'Login realizado com sucesso!',
-      token,
-      usuario: { id: usuario.id, nome: usuario.nome, email: usuario.email, plano: usuario.plano },
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ erro: 'Erro interno do servidor' });
-  }
-});
+    const { uid } = req.usuario;
+    const snap = await db.collection('users').doc(uid).get();
+    if (!snap.exists) return res.status(404).json({ erro: 'Usuário não encontrado' });
 
-// Perfil
-app.get('/usuario/perfil', autenticar, async (req, res) => {
-  try {
-    const [rows] = await db.query(
-      'SELECT id, nome, email, plano, criado_em FROM usuarios WHERE id = ?',
-      [req.usuario.id]
-    );
-    if (rows.length === 0)
-      return res.status(404).json({ erro: 'Usuário não encontrado' });
-    res.json(rows[0]);
-  } catch {
-    res.status(500).json({ erro: 'Erro interno do servidor' });
-  }
-});
-
-// Esqueci senha
-app.post('/auth/esqueci-senha', async (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ erro: 'Informe o e-mail' });
-  try {
-    const [usuarios] = await db.query('SELECT * FROM usuarios WHERE email = ?', [email]);
-    if (usuarios.length === 0)
-      return res.json({ mensagem: 'Se este e-mail estiver cadastrado, você receberá as instruções.' });
-
-    const usuario = usuarios[0];
-    const token = crypto.randomBytes(32).toString('hex');
-    const expira = new Date(Date.now() + 60 * 60 * 1000);
-
-    await db.query('DELETE FROM recuperacao_senha WHERE usuario_id = ?', [usuario.id]);
-    await db.query(
-      'INSERT INTO recuperacao_senha (usuario_id, token, expira_em) VALUES (?, ?, ?)',
-      [usuario.id, token, expira]
-    );
-
-    await transporter.sendMail({
-      from: `"Aspen Core" <${process.env.EMAIL_USER}>`,
-      to: email,
-      subject: 'Recuperação de senha — Aspen Core',
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto;">
-          <div style="background: #0b6b6b; padding: 24px; border-radius: 12px 12px 0 0;">
-            <h2 style="color: white; margin: 0;">🔐 Aspen Core</h2>
-            <p style="color: rgba(255,255,255,0.8); margin: 4px 0 0;">Segurança Digital</p>
-          </div>
-          <div style="background: #f8fafc; padding: 32px; border-radius: 0 0 12px 12px; border: 1px solid #e2e8f0;">
-            <h3 style="color: #0f172a;">Olá, ${usuario.nome}!</h3>
-            <p style="color: #64748b;">Seu código de recuperação é:</p>
-            <div style="background: #0b6b6b; color: white; font-size: 32px; font-weight: bold; text-align: center; padding: 20px; border-radius: 10px; letter-spacing: 8px; margin: 20px 0;">
-              ${token.substring(0, 6).toUpperCase()}
-            </div>
-            <p style="color: #94a3b8; font-size: 13px;">Este código expira em <strong>1 hora</strong>.</p>
-            <p style="color: #94a3b8; font-size: 13px;">Se você não solicitou isso, ignore este e-mail.</p>
-          </div>
-        </div>
-      `,
+    await db.collection('users').doc(uid).update({
+      last_login_at: new Date().toISOString(),
     });
 
-    res.json({ mensagem: 'Se este e-mail estiver cadastrado, você receberá as instruções.' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ erro: 'Erro ao enviar e-mail' });
-  }
-});
-
-// Redefinir senha
-app.post('/auth/redefinir-senha', async (req, res) => {
-  const { email, codigo, novaSenha } = req.body;
-  if (!email || !codigo || !novaSenha)
-    return res.status(400).json({ erro: 'Preencha todos os campos' });
-  if (novaSenha.length < 8)
-    return res.status(400).json({ erro: 'Senha deve ter pelo menos 8 caracteres' });
-  try {
-    const [usuarios] = await db.query('SELECT * FROM usuarios WHERE email = ?', [email]);
-    if (usuarios.length === 0)
-      return res.status(404).json({ erro: 'E-mail não encontrado' });
-    const usuario = usuarios[0];
-    const [tokens] = await db.query(
-      `SELECT * FROM recuperacao_senha 
-       WHERE usuario_id = ? AND usado = FALSE AND expira_em > NOW()
-       ORDER BY id DESC LIMIT 1`,
-      [usuario.id]
-    );
-    if (tokens.length === 0)
-      return res.status(400).json({ erro: 'Código inválido ou expirado' });
-    const tokenSalvo = tokens[0].token.substring(0, 6).toUpperCase();
-    if (codigo.toUpperCase() !== tokenSalvo)
-      return res.status(400).json({ erro: 'Código incorreto' });
-    const senhaCriptografada = await bcrypt.hash(novaSenha, 10);
-    await db.query('UPDATE usuarios SET senha = ? WHERE id = ?', [senhaCriptografada, usuario.id]);
-    await db.query('UPDATE recuperacao_senha SET usado = TRUE WHERE usuario_id = ?', [usuario.id]);
-    res.json({ mensagem: 'Senha redefinida com sucesso!' });
+    res.json({ id: uid, ...snap.data() });
   } catch (err) {
     console.error(err);
     res.status(500).json({ erro: 'Erro interno do servidor' });
   }
 });
 
+// Atualiza o plano do usuário
+app.put('/auth/plan', autenticar, async (req, res) => {
+  const { plan } = req.body;
+  if (!['basico', 'padrao', 'premium'].includes(plan)) {
+    return res.status(400).json({ erro: 'Plano inválido' });
+  }
+  try {
+    const { uid } = req.usuario;
+    await db.collection('users').doc(uid).update({
+      plan,
+      plan_updated_at: new Date().toISOString(),
+    });
+    res.json({ mensagem: 'Plano atualizado com sucesso!' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: 'Erro interno do servidor' });
+  }
+});
+
+// ============================================================
+// DEVICES
+// ============================================================
+
+app.get('/devices', autenticar, async (req, res) => {
+  try {
+    const { uid } = req.usuario;
+    const snap = await db.collection('users').doc(uid).collection('devices').get();
+    const devices = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    res.json(devices);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: 'Erro interno do servidor' });
+  }
+});
+
+app.post('/devices', autenticar, async (req, res) => {
+  const { name, type, os } = req.body;
+  if (!name || !type) return res.status(400).json({ erro: 'Preencha nome e tipo do dispositivo' });
+  try {
+    const { uid } = req.usuario;
+    const ref = await db.collection('users').doc(uid).collection('devices').add({
+      name,
+      type,
+      os: os || null,
+      status: 'ativo',
+      last_access_at: null,
+      created_at: new Date().toISOString(),
+    });
+    res.status(201).json({ id: ref.id, mensagem: 'Dispositivo adicionado com sucesso!' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: 'Erro interno do servidor' });
+  }
+});
+
+app.get('/devices/:id', autenticar, async (req, res) => {
+  try {
+    const { uid } = req.usuario;
+    const snap = await db.collection('users').doc(uid).collection('devices').doc(req.params.id).get();
+    if (!snap.exists) return res.status(404).json({ erro: 'Dispositivo não encontrado' });
+    res.json({ id: snap.id, ...snap.data() });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: 'Erro interno do servidor' });
+  }
+});
+
+app.delete('/devices/:id', autenticar, async (req, res) => {
+  try {
+    const { uid } = req.usuario;
+    await db.collection('users').doc(uid).collection('devices').doc(req.params.id).delete();
+    res.json({ mensagem: 'Dispositivo removido com sucesso!' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: 'Erro interno do servidor' });
+  }
+});
+
+// ============================================================
+// PAYMENT METHODS
+// ============================================================
+
+app.get('/payment-methods', autenticar, async (req, res) => {
+  try {
+    const { uid } = req.usuario;
+    const snap = await db.collection('users').doc(uid).collection('payment_methods').get();
+    const methods = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    res.json(methods);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: 'Erro interno do servidor' });
+  }
+});
+
+app.post('/payment-methods/card', autenticar, async (req, res) => {
+  const { card_last4, card_brand, card_expiry, card_holder, is_default, billing_day, auto_renew } = req.body;
+  if (!card_last4 || !card_brand) {
+    return res.status(400).json({ erro: 'Preencha os dados do cartão' });
+  }
+  try {
+    const { uid } = req.usuario;
+    const ref = await db.collection('users').doc(uid).collection('payment_methods').add({
+      type: 'card',
+      card_last4,
+      card_brand,
+      card_expiry: card_expiry || null,
+      card_holder: card_holder || null,
+      is_default: !!is_default,
+      billing_day: billing_day || null,
+      auto_renew: auto_renew !== undefined ? auto_renew : true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    res.status(201).json({ id: ref.id, mensagem: 'Cartão adicionado com sucesso!' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: 'Erro interno do servidor' });
+  }
+});
+
+app.post('/payment-methods/pix', autenticar, async (req, res) => {
+  const { is_default } = req.body;
+  try {
+    const { uid } = req.usuario;
+    const ref = await db.collection('users').doc(uid).collection('payment_methods').add({
+      type: 'pix',
+      is_default: !!is_default,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    res.status(201).json({ id: ref.id, mensagem: 'Pix adicionado com sucesso!' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: 'Erro interno do servidor' });
+  }
+});
+
+app.put('/payment-methods/:id', autenticar, async (req, res) => {
+  try {
+    const { uid } = req.usuario;
+    await db.collection('users').doc(uid).collection('payment_methods').doc(req.params.id).update({
+      ...req.body,
+      updated_at: new Date().toISOString(),
+    });
+    res.json({ mensagem: 'Método de pagamento atualizado com sucesso!' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: 'Erro interno do servidor' });
+  }
+});
+
+app.delete('/payment-methods/:id', autenticar, async (req, res) => {
+  try {
+    const { uid } = req.usuario;
+    await db.collection('users').doc(uid).collection('payment_methods').doc(req.params.id).delete();
+    res.json({ mensagem: 'Método de pagamento removido com sucesso!' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: 'Erro interno do servidor' });
+  }
+});
+
+// ============================================================
+// CHECKOUT
+// ============================================================
+
+app.post('/payment/checkout', autenticar, async (req, res) => {
+  const { plan } = req.body;
+  if (!['basico', 'padrao', 'premium'].includes(plan)) {
+    return res.status(400).json({ erro: 'Plano inválido' });
+  }
+  try {
+    const { uid } = req.usuario;
+    // Aqui entraria a integração real com um gateway de pagamento (Stripe, Pagar.me, etc.)
+    // Por enquanto, apenas atualizamos o plano diretamente.
+    await db.collection('users').doc(uid).update({
+      plan,
+      plan_updated_at: new Date().toISOString(),
+    });
+    res.json({ mensagem: 'Checkout realizado com sucesso!' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ erro: 'Erro ao processar checkout' });
+  }
+});
+
+// ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ API Aspen Core rodando na porta ${PORT}`);
