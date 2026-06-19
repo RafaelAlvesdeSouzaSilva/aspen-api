@@ -1,6 +1,9 @@
 const express = require('express');
 const cors = require('cors');
-const admin = require('firebase-admin');
+const { initializeApp } = require('firebase-admin/app');
+const { cert } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
+const { getFirestore } = require('firebase-admin/firestore');
 require('dotenv').config();
 
 const app = express();
@@ -17,11 +20,12 @@ app.use(express.json());
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+const firebaseApp = initializeApp({
+  credential: cert(serviceAccount),
 });
 
-const db = admin.firestore();
+const auth = getAuth(firebaseApp);
+const db = getFirestore(firebaseApp);
 
 // ============================================================
 // Middleware de autenticação — valida o ID token do Firebase
@@ -30,7 +34,7 @@ const autenticar = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ erro: 'Token não fornecido' });
   try {
-    const decoded = await admin.auth().verifyIdToken(token);
+    const decoded = await auth.verifyIdToken(token);
     req.usuario = decoded; // contém uid, email, etc.
     next();
   } catch (err) {
